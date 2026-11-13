@@ -13,7 +13,7 @@ describe('Puppeteer plugin test', () => {
 	let result, content, server;
 
 	before('start webserver', () => server = startWebserver(SERVE_WEBSITE_PORT));
-	after('stop webserver', () => server.close())
+	after('stop webserver', () => server.close());
 
 	describe('Dynamic content', () => {
 		before('scrape website', async () => {
@@ -187,6 +187,174 @@ describe('Puppeteer plugin test', () => {
 			expect(cjkContent).to.contain('<div id="cjk-characters-test">磁致伸缩位移传感器 影响大跨度桥梁施工控制的因素</div>');
 		});
 	});
+
+	// Regression tests for request headers leaking between resources: the
+	// headers of the most recent request were stored globally, so concurrent
+	// page renders reused them, and setExtraHTTPHeaders passed them to every
+	// request made by the page - including cross-origin subresources.
+	// Headers must be scoped to their resource: only the page navigation
+	// itself and its same-origin redirects may use them.
+	describe('Per-resource request headers', () => {
+		const ORIGIN_A_PORT = 4570;
+		const ORIGIN_B_PORT = 4571;
+		const originA = `http://localhost:${ORIGIN_A_PORT}`;
+		const originB = `http://localhost:${ORIGIN_B_PORT}`;
+		let authServer, cdnServer;
+
+		before('start dual-origin webservers', () => {
+			authServer = startAuthWebserver(ORIGIN_A_PORT, originB);
+			cdnServer = startCdnWebserver(ORIGIN_B_PORT);
+		});
+		after('stop dual-origin webservers', () => {
+			authServer.close();
+			cdnServer.close();
+		});
+
+		describe('Concurrent pages with different credentials', () => {
+			let files;
+
+			before('clear request logs', () => {
+				authServer.requestLog.length = 0;
+				cdnServer.requestLog.length = 0;
+			});
+			before('scrape website', async () => {
+				await scrape({
+					// member and guest are discovered from the index page, so
+					// they are requested and rendered concurrently
+					urls: [`${originA}/`],
+					directory: directory,
+					recursive: true,
+					plugins: [
+						// sets a different Authorization header per resource,
+						// like a plugin refreshing an expiring token would
+						new PerResourceHeadersPlugin(resource =>
+							resource.url.endsWith('/member') ? {authorization: 'Bearer member-token'} : {}),
+						// render concurrently, so the renders race if headers were shared
+						new PuppeteerPlugin({ exclusiveRendering: false })
+					]
+				});
+			});
+			before('get content from files', () => {
+				files = {
+					member: fs.readFileSync(`${directory}/member.html`).toString(),
+					guest: fs.readFileSync(`${directory}/guest.html`).toString()
+				};
+			});
+			after('delete dir', () => fs.removeSync(directory));
+
+			it('should render each page with its own headers', () => {
+				expect(files.member).to.contain('auth:Bearer member-token');
+				expect(files.guest).to.contain('auth:none');
+				expect(files.guest).to.not.contain('member-token');
+			});
+
+			it('should send the Authorization header with the page navigation itself', () => {
+				const navigations = authServer.requestLog.filter(request => request.url === '/member' && request.fromBrowser);
+				expect(navigations).to.have.lengthOf(1);
+				expect(navigations[0].authorization).to.eql('Bearer member-token');
+			});
+
+			it('should not send the Authorization header with the guest page navigation', () => {
+				const navigations = authServer.requestLog.filter(request => request.url === '/guest' && request.fromBrowser);
+				expect(navigations).to.have.lengthOf(1);
+				expect(navigations[0].authorization).to.eql(null);
+			});
+
+			it('should not leak the Authorization header to cross-origin subresources', () => {
+				const requests = cdnServer.requestLog.filter(request => request.url === '/tracker.png' && request.fromBrowser);
+				expect(requests.length).to.be.greaterThan(0);
+				requests.forEach(request => expect(request.authorization).to.eql(null));
+			});
+
+			it('should not send the Authorization header to same-origin subresources', () => {
+				const requests = authServer.requestLog.filter(request => request.url === '/pixel.png' && request.fromBrowser);
+				expect(requests.length).to.be.greaterThan(0);
+				requests.forEach(request => expect(request.authorization).to.eql(null));
+			});
+		});
+
+		describe('Redirects', () => {
+			let files;
+
+			before('clear request logs', () => {
+				authServer.requestLog.length = 0;
+				cdnServer.requestLog.length = 0;
+			});
+			before('scrape website', async () => {
+				await scrape({
+					urls: [
+						{ url: `${originA}/redirect-member`, filename: 'redirect-member.html' },
+						{ url: `${originA}/redirect-cross`, filename: 'redirect-cross.html' }
+					],
+					directory: directory,
+					request: {
+						headers: { authorization: 'Bearer member-token' }
+					},
+					plugins: [ new PuppeteerPlugin() ]
+				});
+			});
+			before('get content from files', () => {
+				files = {
+					redirectMember: fs.readFileSync(`${directory}/redirect-member.html`).toString(),
+					redirectCross: fs.readFileSync(`${directory}/redirect-cross.html`).toString()
+				};
+			});
+			after('delete dir', () => fs.removeSync(directory));
+
+			it('should keep the headers on a same-origin redirect', () => {
+				expect(files.redirectMember).to.contain('auth:Bearer member-token');
+			});
+
+			it('should send the headers on the same-origin redirect hop', () => {
+				const requests = authServer.requestLog.filter(request => request.url === '/member' && !request.fromBrowser);
+				expect(requests).to.have.lengthOf(1);
+				expect(requests[0].authorization).to.eql('Bearer member-token');
+			});
+
+			it('should drop the headers on a cross-origin redirect', () => {
+				expect(files.redirectCross).to.contain('auth:none');
+				expect(files.redirectCross).to.not.contain('member-token');
+			});
+
+			it('should not send the headers to the cross-origin redirect target', () => {
+				const requests = cdnServer.requestLog.filter(request => request.url === '/landing');
+				expect(requests.length).to.be.greaterThan(0);
+				requests.forEach(request => expect(request.authorization).to.eql(null));
+			});
+		});
+
+		describe('Retry after a failed request', () => {
+			let flakyContent;
+
+			before('clear request logs', () => {
+				authServer.requestLog.length = 0;
+				cdnServer.requestLog.length = 0;
+			});
+			before('scrape website', async () => {
+				await scrape({
+					urls: [{ url: `${originA}/flaky`, filename: 'flaky.html' }],
+					directory: directory,
+					request: {
+						headers: { authorization: 'Bearer member-token' }
+					},
+					plugins: [ new PuppeteerPlugin() ]
+				});
+			});
+			before('get content from file', () => {
+				flakyContent = fs.readFileSync(`${directory}/flaky.html`).toString();
+			});
+			after('delete dir', () => fs.removeSync(directory));
+
+			it('should render the retried resource with its headers', () => {
+				expect(flakyContent).to.contain('auth:Bearer member-token');
+			});
+
+			it('should have retried the failed request', () => {
+				const requests = authServer.requestLog.filter(request => request.url === '/flaky' && !request.fromBrowser);
+				expect(requests).to.have.lengthOf(2);
+			});
+		});
+	});
 });
 
 // Simulates a website which rotates the session cookie via an ajax call
@@ -291,7 +459,7 @@ function startRedirectingWebserver (port) {
 	return server.listen(port);
 }
 
-function startWebserver(port = 3000) {
+function startWebserver (port = 3000) {
 	const serve = serveStatic('./test/mock', {'index': ['index.html']});
 	const server = http.createServer(function onRequest (req, res) {
 		// Serve the CJK page the same way as the website from #103: utf-8 is
@@ -301,8 +469,110 @@ function startWebserver(port = 3000) {
 			res.end(fs.readFileSync('./test/mock/cjk.html'));
 			return;
 		}
-		serve(req, res, finalhandler(req, res))
+		serve(req, res, finalhandler(req, res));
 	});
 
-	return server.listen(port)
+	return server.listen(port);
+}
+
+// Adds per-resource request headers, like a plugin which refreshes an
+// expiring auth token before each request would. Must be registered
+// before PuppeteerPlugin so the puppeteer plugin sees the final headers.
+class PerResourceHeadersPlugin {
+	constructor (headersFor) {
+		this.headersFor = headersFor;
+	}
+
+	apply (registerAction) {
+		registerAction('beforeRequest', ({resource, requestOptions}) => ({
+			requestOptions: Object.assign({}, requestOptions, {
+				headers: Object.assign({}, requestOptions.headers, this.headersFor(resource))
+			})
+		}));
+	}
+}
+
+const PIXEL = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+
+// Origin A of the dual-origin test site. Echoes the Authorization header
+// into the html, so the saved page shows which credentials the browser
+// (or got) presented. The member page embeds a same-origin and a
+// cross-origin image to probe header inheritance by subresources.
+function startAuthWebserver (port, originB) {
+	const requestLog = [];
+	let flakyHits = 0;
+
+	const server = http.createServer((req, res) => {
+		// got never sends Fetch Metadata headers, the browser always does
+		const fromBrowser = Boolean(req.headers['sec-fetch-dest']);
+		requestLog.push({
+			url: req.url,
+			authorization: req.headers.authorization || null,
+			fromBrowser
+		});
+
+		if (req.url === '/favicon.ico') {
+			res.writeHead(404).end();
+			return;
+		}
+
+		// fails the first request with a dropped connection, so got retries it
+		if (req.url === '/flaky' && flakyHits++ === 0) {
+			req.socket.destroy();
+			return;
+		}
+
+		if (req.url === '/redirect-member') {
+			res.writeHead(302, { Location: '/member' }).end();
+			return;
+		}
+		if (req.url === '/redirect-cross') {
+			res.writeHead(302, { Location: `${originB}/landing` }).end();
+			return;
+		}
+
+		// respond slowly, so concurrent requests and renders overlap
+		setTimeout(() => {
+			if (req.url === '/pixel.png') {
+				res.writeHead(200, { 'Content-Type': 'image/png' }).end(PIXEL);
+				return;
+			}
+			res.setHeader('Content-Type', 'text/html');
+			if (req.url === '/') {
+				res.end('<html><body><a href="/member">member</a><a href="/guest">guest</a></body></html>');
+				return;
+			}
+			const images = req.url === '/member'
+				? `<img src="${originB}/tracker.png"><img src="/pixel.png">`
+				: '';
+			res.end(`<html><body><h1>auth:${req.headers.authorization || 'none'}</h1>${images}</body></html>`);
+		}, 100);
+	});
+
+	server.requestLog = requestLog;
+	return server.listen(port);
+}
+
+// Origin B of the dual-origin test site: a "third party" which must never
+// receive origin A's credentials.
+function startCdnWebserver (port) {
+	const requestLog = [];
+
+	const server = http.createServer((req, res) => {
+		requestLog.push({
+			url: req.url,
+			authorization: req.headers.authorization || null,
+			fromBrowser: Boolean(req.headers['sec-fetch-dest'])
+		});
+
+		if (req.url === '/tracker.png') {
+			res.writeHead(200, { 'Content-Type': 'image/png' }).end(PIXEL);
+			return;
+		}
+		res.setHeader('Content-Type', 'text/html');
+		res.end(`<html><body><h1>auth:${req.headers.authorization || 'none'}</h1></body></html>`);
+	});
+
+	server.requestLog = requestLog;
+	return server.listen(port);
 }
